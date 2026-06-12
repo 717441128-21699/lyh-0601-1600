@@ -13,12 +13,17 @@ import {
   SceneParams,
   ReviewStatus,
   AuditIntensity,
+  RemoteAuditResult,
+  RemoteAuditConfig,
+  WhitelistHitInfo,
+  RuleSnapshot,
 } from '../types';
 import { RuleConfigManager } from '../config/RuleConfigManager';
 
 export class AuditEngine {
   private detectors: Map<RiskCategory, Detector> = new Map();
   private ruleConfigManager: RuleConfigManager;
+  private remoteAuditConfig: RemoteAuditConfig | null = null;
 
   constructor(ruleConfigManager: RuleConfigManager) {
     this.ruleConfigManager = ruleConfigManager;
@@ -32,30 +37,73 @@ export class AuditEngine {
     this.detectors.set(RiskCategory.SENSITIVE, new SensitiveDetector());
   }
 
+  public setRemoteAuditConfig(config: RemoteAuditConfig | null): void {
+    this.remoteAuditConfig = config;
+  }
+
   public async audit(request: TextAuditRequest): Promise<TextAuditResult> {
     const startTime = Date.now();
     const requestId = request.requestId || this.generateRequestId();
     const sceneParams = this.ruleConfigManager.getSceneParams(request.scene, request.businessTag);
 
+    const localResult = this.performLocalAudit(request.text, requestId, sceneParams, startTime);
+
+    const shouldTriggerRemote = this.shouldTriggerRemoteAudit(localResult.riskLevel);
+    let remoteResult: RemoteAuditResult | undefined;
+    let remoteAuditUsed = false;
+    let remoteAuditFallback = false;
+
+    if (shouldTriggerRemote && this.remoteAuditConfig) {
+      remoteAuditUsed = true;
+      try {
+        const timeout = this.remoteAuditConfig.timeoutMs || 5000;
+        remoteResult = await this.auditWithTimeout(request, timeout);
+      } catch {
+        remoteAuditFallback = true;
+        if (!this.remoteAuditConfig.fallbackToLocal) {
+          throw new Error('Remote audit failed and fallback to local is disabled');
+        }
+      }
+    }
+
+    if (remoteResult && !remoteAuditFallback) {
+      return this.mergeResults(localResult, remoteResult, requestId, request.text, sceneParams, startTime, true, false);
+    }
+
+    localResult.remoteAuditUsed = remoteAuditUsed;
+    localResult.remoteAuditFallback = remoteAuditFallback;
+    if (remoteResult) {
+      localResult.remoteResult = remoteResult;
+    }
+    return localResult;
+  }
+
+  private performLocalAudit(
+    text: string,
+    requestId: string,
+    sceneParams: SceneParams,
+    startTime: number
+  ): TextAuditResult {
     let allFragments: HitFragment[] = [];
 
     this.detectors.forEach((detector) => {
-      const fragments = detector.detect(request.text);
+      const fragments = detector.detect(text);
       allFragments = allFragments.concat(fragments);
     });
 
-    const filteredFragments = this.filterWhitelist(allFragments);
+    const { filteredFragments, whitelistHitInfos } = this.filterWhitelistWithInfo(allFragments, text);
     const deduplicatedFragments = this.deduplicateFragments(filteredFragments);
     const hitDetails = this.groupByCategory(deduplicatedFragments, sceneParams.intensity);
     const overallRiskLevel = this.calculateOverallRiskLevel(hitDetails);
     const isPassed = !this.ruleConfigManager.shouldBlock(overallRiskLevel, sceneParams.intensity);
     const suggestions = this.generateSuggestions(hitDetails, isPassed);
-    const displayReason = this.generateDisplayReason(hitDetails, isPassed, overallRiskLevel);
-    const whitelistHits = this.getWhitelistHits(allFragments, filteredFragments);
+    const displayReason = this.generateDisplayReason(hitDetails, isPassed, overallRiskLevel, whitelistHitInfos);
+    const whitelistHits = whitelistHitInfos.map((info) => info.word);
+    const ruleSnapshot = this.ruleConfigManager.captureRuleSnapshot(sceneParams.scene);
 
-    const result: TextAuditResult = {
+    return {
       requestId,
-      text: request.text,
+      text,
       riskLevel: overallRiskLevel,
       isPassed,
       hitDetails,
@@ -63,21 +111,159 @@ export class AuditEngine {
       displayReason,
       businessTag: sceneParams.businessTag || '通用内容',
       whitelistHits,
+      whitelistHitInfos,
       sceneParams,
       retryCount: 0,
       reviewStatus: isPassed ? ReviewStatus.APPROVED : ReviewStatus.PENDING,
       isMisjudged: false,
+      manuallyReviewed: false,
       timestamp: Date.now(),
       costMs: Date.now() - startTime,
+      localResult: {
+        riskLevel: overallRiskLevel,
+        isPassed,
+        hitDetails,
+        displayReason,
+      },
+      remoteAuditUsed: false,
+      remoteAuditFallback: false,
+      ruleVersion: sceneParams.ruleVersion,
+      ruleSnapshot,
     };
-
-    return result;
   }
 
-  private filterWhitelist(fragments: HitFragment[]): HitFragment[] {
-    return fragments.filter((fragment) => {
-      return !this.ruleConfigManager.isWhitelisted(fragment.text, fragment.category);
+  private filterWhitelistWithInfo(fragments: HitFragment[], text: string): {
+    filteredFragments: HitFragment[];
+    whitelistHitInfos: WhitelistHitInfo[];
+  } {
+    const whitelistHitInfos: WhitelistHitInfo[] = [];
+    const whitelistWordMap = new Map<string, { info: import('../types').WhitelistWord; releasedTexts: Set<string> }>();
+
+    const releasedRanges: Array<{ start: number; end: number; source: string; reason?: string }> = [];
+
+    const allWhitelistWords = this.ruleConfigManager.getWhitelistWords();
+    for (const wlWord of allWhitelistWords) {
+      const lowerText = text.toLowerCase();
+      const lowerWord = wlWord.word.toLowerCase();
+      let searchIndex = 0;
+      while (searchIndex < lowerText.length) {
+        const foundIndex = lowerText.indexOf(lowerWord, searchIndex);
+        if (foundIndex === -1) break;
+
+        const key = wlWord.word.toLowerCase();
+        if (!whitelistWordMap.has(key)) {
+          whitelistWordMap.set(key, { info: wlWord, releasedTexts: new Set() });
+        }
+
+        const contextStart = Math.max(0, foundIndex - 30);
+        const contextEnd = Math.min(text.length, foundIndex + wlWord.word.length + 30);
+        releasedRanges.push({
+          start: contextStart,
+          end: contextEnd,
+          source: wlWord.word,
+          reason: wlWord.reason,
+        });
+
+        for (const fragment of fragments) {
+          if (fragment.start >= contextStart && fragment.end <= contextEnd) {
+            whitelistWordMap.get(key)!.releasedTexts.add(fragment.text);
+          }
+        }
+
+        searchIndex = foundIndex + wlWord.word.length;
+      }
+    }
+
+    for (const fragment of fragments) {
+      const { whitelisted, info } = this.ruleConfigManager.isWhitelistedAnyCategory(fragment.text);
+      if (whitelisted && info) {
+        const key = info.word.toLowerCase();
+        if (!whitelistWordMap.has(key)) {
+          whitelistWordMap.set(key, { info, releasedTexts: new Set() });
+        }
+        const entry = whitelistWordMap.get(key)!;
+        entry.releasedTexts.add(fragment.text);
+
+        releasedRanges.push({
+          start: fragment.start,
+          end: fragment.end,
+          source: info.word,
+          reason: info.reason,
+        });
+      }
+    }
+
+    for (const [key, entry] of whitelistWordMap) {
+      const relatedPatterns = entry.info.relatedPatterns || [];
+      for (const pattern of relatedPatterns) {
+        for (const fragment of fragments) {
+          if (
+            fragment.text.toLowerCase().includes(pattern.toLowerCase()) ||
+            pattern.toLowerCase().includes(fragment.text.toLowerCase())
+          ) {
+            entry.releasedTexts.add(fragment.text);
+            releasedRanges.push({
+              start: fragment.start,
+              end: fragment.end,
+              source: entry.info.word,
+              reason: entry.info.reason,
+            });
+          }
+        }
+      }
+    }
+
+    const filteredFragments = fragments.filter((fragment) => {
+      const isDirectlyWhitelisted = this.ruleConfigManager.isWhitelistedAnyCategory(fragment.text).whitelisted;
+
+      if (isDirectlyWhitelisted) {
+        fragment.whitelisted = true;
+        const checkResult = this.ruleConfigManager.isWhitelistedAnyCategory(fragment.text);
+        if (checkResult.info) {
+          fragment.whitelistReason = checkResult.info.reason;
+          fragment.whitelistSource = checkResult.info.word;
+        }
+        return false;
+      }
+
+      const isReleased = releasedRanges.some(
+        (range) =>
+          fragment.start >= range.start &&
+          fragment.end <= range.end
+      ) || releasedRanges.some(
+        (range) =>
+          fragment.start < range.end &&
+          fragment.end > range.start
+      );
+
+      if (isReleased) {
+        fragment.whitelisted = true;
+        const matchingRange = releasedRanges.find(
+          (range) =>
+            fragment.start >= range.start && fragment.end <= range.end
+        ) || releasedRanges.find(
+          (range) => fragment.start < range.end && fragment.end > range.start
+        );
+        if (matchingRange) {
+          fragment.whitelistReason = matchingRange.reason;
+          fragment.whitelistSource = matchingRange.source;
+        }
+        return false;
+      }
+
+      return true;
     });
+
+    for (const [, entry] of whitelistWordMap) {
+      whitelistHitInfos.push({
+        word: entry.info.word,
+        category: entry.info.category,
+        reason: entry.info.reason,
+        releasedFragments: Array.from(entry.releasedTexts),
+      });
+    }
+
+    return { filteredFragments, whitelistHitInfos };
   }
 
   private deduplicateFragments(fragments: HitFragment[]): HitFragment[] {
@@ -222,9 +408,24 @@ export class AuditEngine {
     return suggestions;
   }
 
-  private generateDisplayReason(hitDetails: HitDetail[], isPassed: boolean, level: RiskLevel): string {
-    if (isPassed) {
+  private generateDisplayReason(
+    hitDetails: HitDetail[],
+    isPassed: boolean,
+    level: RiskLevel,
+    whitelistHitInfos: WhitelistHitInfo[]
+  ): string {
+    if (isPassed && hitDetails.length === 0) {
       return '内容合规，审核通过';
+    }
+
+    if (isPassed && whitelistHitInfos.length > 0) {
+      const whitelistDesc = whitelistHitInfos.map((info) => {
+        const released = info.releasedFragments.length > 0
+          ? `（已豁免: ${info.releasedFragments.join('、')}）`
+          : '';
+        return `${info.word}${released}`;
+      }).join('、');
+      return `内容合规，审核通过。白名单放行: ${whitelistDesc}`;
     }
 
     if (hitDetails.length === 0) {
@@ -240,21 +441,110 @@ export class AuditEngine {
     };
 
     const topCategories = hitDetails.slice(0, 2).map((d) => categoryNames[d.category]);
-    return `检测到${topCategories.join('、')}等违规内容`;
+    let reason = `检测到${topCategories.join('、')}等违规内容`;
+
+    if (whitelistHitInfos.length > 0) {
+      const whitelistDesc = whitelistHitInfos.map((info) => info.word).join('、');
+      reason += `；白名单已放行: ${whitelistDesc}`;
+    }
+
+    return reason;
   }
 
-  private getWhitelistHits(allFragments: HitFragment[], filteredFragments: HitFragment[]): string[] {
-    const filteredTexts = new Set(filteredFragments.map((f) => f.text.toLowerCase()));
-    const whitelistHits: string[] = [];
+  private shouldTriggerRemoteAudit(localRiskLevel: RiskLevel): boolean {
+    if (!this.remoteAuditConfig) return false;
 
-    allFragments.forEach((fragment) => {
-      const lowerText = fragment.text.toLowerCase();
-      if (!filteredTexts.has(lowerText) && !whitelistHits.includes(lowerText)) {
-        whitelistHits.push(fragment.text);
+    const triggerLevel = this.remoteAuditConfig.triggerLevel || RiskLevel.MEDIUM;
+    const levelPriority = {
+      [RiskLevel.SAFE]: 0,
+      [RiskLevel.LOW]: 1,
+      [RiskLevel.MEDIUM]: 2,
+      [RiskLevel.HIGH]: 3,
+      [RiskLevel.DANGEROUS]: 4,
+    };
+
+    return levelPriority[localRiskLevel] >= levelPriority[triggerLevel];
+  }
+
+  private async auditWithTimeout(
+    request: TextAuditRequest,
+    timeoutMs: number
+  ): Promise<RemoteAuditResult> {
+    return Promise.race([
+      this.remoteAuditConfig!.channel.audit(request),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Remote audit timeout')), timeoutMs)
+      ),
+    ]);
+  }
+
+  private mergeResults(
+    localResult: TextAuditResult,
+    remoteResult: RemoteAuditResult,
+    requestId: string,
+    text: string,
+    sceneParams: SceneParams,
+    startTime: number,
+    remoteAuditUsed: boolean,
+    remoteAuditFallback: boolean
+  ): TextAuditResult {
+    const levelPriority = {
+      [RiskLevel.SAFE]: 0,
+      [RiskLevel.LOW]: 1,
+      [RiskLevel.MEDIUM]: 2,
+      [RiskLevel.HIGH]: 3,
+      [RiskLevel.DANGEROUS]: 4,
+    };
+
+    const mergedRiskLevel = levelPriority[remoteResult.riskLevel] >= levelPriority[localResult.riskLevel]
+      ? remoteResult.riskLevel
+      : localResult.riskLevel;
+
+    const isPassed = !this.ruleConfigManager.shouldBlock(mergedRiskLevel, sceneParams.intensity);
+
+    const localCategorySet = new Set(localResult.hitDetails.map((d) => d.category));
+    const mergedHitDetails = [...localResult.hitDetails];
+    remoteResult.hitDetails.forEach((detail) => {
+      if (!localCategorySet.has(detail.category)) {
+        mergedHitDetails.push(detail);
       }
     });
 
-    return whitelistHits;
+    const mergedSuggestions = [...new Set([...localResult.suggestions, ...remoteResult.suggestions])];
+    const displayReason = isPassed
+      ? '内容合规，审核通过'
+      : remoteResult.displayReason || localResult.displayReason;
+
+    return {
+      requestId,
+      text,
+      riskLevel: mergedRiskLevel,
+      isPassed,
+      hitDetails: mergedHitDetails,
+      suggestions: mergedSuggestions,
+      displayReason,
+      businessTag: sceneParams.businessTag || '通用内容',
+      whitelistHits: localResult.whitelistHits,
+      whitelistHitInfos: localResult.whitelistHitInfos,
+      sceneParams,
+      retryCount: 0,
+      reviewStatus: isPassed ? ReviewStatus.APPROVED : ReviewStatus.PENDING,
+      isMisjudged: false,
+      manuallyReviewed: false,
+      timestamp: Date.now(),
+      costMs: Date.now() - startTime,
+      localResult: {
+        riskLevel: localResult.riskLevel,
+        isPassed: localResult.isPassed,
+        hitDetails: localResult.hitDetails,
+        displayReason: localResult.displayReason,
+      },
+      remoteResult,
+      remoteAuditUsed,
+      remoteAuditFallback,
+      ruleVersion: sceneParams.ruleVersion,
+      ruleSnapshot: localResult.ruleSnapshot,
+    };
   }
 
   private generateRequestId(): string {

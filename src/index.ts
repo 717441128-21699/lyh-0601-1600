@@ -12,6 +12,13 @@ import {
   MisjudgeFeedback,
   ManualReviewRecord,
   HitDetail,
+  RemoteAuditConfig,
+  RemoteAuditChannel,
+  RuleVersion,
+  RuleSnapshot,
+  AuditChainResult,
+  FeedbackReasonCategory,
+  FeedbackStatus,
 } from './types';
 import { RuleConfigManager } from './config/RuleConfigManager';
 import { AuditEngine } from './engine/AuditEngine';
@@ -45,6 +52,10 @@ export class ContentAuditSDK {
     this.reviewManager = new ReviewManager();
     this.statisticsManager = new StatisticsManager();
     this.retryManager = new RetryManager(this.auditEngine, config);
+
+    if (config.remoteAudit) {
+      this.auditEngine.setRemoteAuditConfig(config.remoteAudit);
+    }
   }
 
   public async auditText(request: TextAuditRequest): Promise<TextAuditResult> {
@@ -60,7 +71,6 @@ export class ContentAuditSDK {
       this.reviewManager.storeResult(r);
       this.statisticsManager.recordResult(r);
     });
-    this.statisticsManager.recordBatchResult(result);
     return result;
   }
 
@@ -76,6 +86,17 @@ export class ContentAuditSDK {
     return this.reviewManager.queryByRequestId(requestId);
   }
 
+  public queryAuditChain(requestId: string): AuditChainResult | null {
+    const chain = this.reviewManager.queryAuditChain(requestId);
+    return chain;
+  }
+
+  public explainAuditChain(requestId: string): string | null {
+    const chain = this.reviewManager.queryAuditChain(requestId);
+    if (!chain) return null;
+    return this.resultInterpreter.explainAuditChain(chain);
+  }
+
   public manualReview(
     requestId: string,
     status: ReviewStatus,
@@ -83,21 +104,33 @@ export class ContentAuditSDK {
     comment?: string,
     isMisjudged = false
   ): ManualReviewRecord | null {
-    return this.reviewManager.manualReview(
+    const record = this.reviewManager.manualReview(
       requestId,
       status,
       reviewer,
       comment,
       isMisjudged
     );
+    if (record) {
+      this.statisticsManager.markManuallyReviewed(requestId);
+    }
+    return record;
   }
 
   public approve(requestId: string, reviewer: string, comment?: string): ManualReviewRecord | null {
-    return this.reviewManager.approve(requestId, reviewer, comment);
+    const record = this.reviewManager.approve(requestId, reviewer, comment);
+    if (record) {
+      this.statisticsManager.markManuallyReviewed(requestId);
+    }
+    return record;
   }
 
   public reject(requestId: string, reviewer: string, comment?: string): ManualReviewRecord | null {
-    return this.reviewManager.reject(requestId, reviewer, comment);
+    const record = this.reviewManager.reject(requestId, reviewer, comment);
+    if (record) {
+      this.statisticsManager.markManuallyReviewed(requestId);
+    }
+    return record;
   }
 
   public markMisjudged(
@@ -105,21 +138,30 @@ export class ContentAuditSDK {
     reviewer: string,
     comment?: string
   ): ManualReviewRecord | null {
-    return this.reviewManager.markMisjudged(requestId, reviewer, comment);
+    const record = this.reviewManager.markMisjudged(requestId, reviewer, comment);
+    if (record) {
+      this.statisticsManager.markManuallyReviewed(requestId);
+    }
+    return record;
   }
 
-  public submitMisjudgeFeedback(
-    requestId: string,
-    category: RiskCategory,
-    feedback: string,
-    contact?: string
-  ): MisjudgeFeedback {
-    return this.reviewManager.submitMisjudgeFeedback(
-      requestId,
-      category,
-      feedback,
-      contact
-    );
+  public submitMisjudgeFeedback(params: {
+    requestId: string;
+    category: RiskCategory;
+    feedback: string;
+    reasonCategory: FeedbackReasonCategory;
+    contact?: string;
+  }): MisjudgeFeedback {
+    return this.reviewManager.submitMisjudgeFeedback(params);
+  }
+
+  public processFeedback(
+    feedbackId: string,
+    handler: string,
+    status: FeedbackStatus.PROCESSING | FeedbackStatus.RESOLVED | FeedbackStatus.DISMISSED,
+    comment?: string
+  ): MisjudgeFeedback | null {
+    return this.reviewManager.processFeedback(feedbackId, handler, status, comment);
   }
 
   public getMisjudgeFeedbacks(requestId?: string): MisjudgeFeedback[] {
@@ -182,10 +224,47 @@ export class ContentAuditSDK {
     return this.ruleConfigManager.getSceneParams(scene, businessTag);
   }
 
+  public setRemoteAuditChannel(config: RemoteAuditConfig): void {
+    this.auditEngine.setRemoteAuditConfig(config);
+    this.config.remoteAudit = config;
+  }
+
+  public disableRemoteAudit(): void {
+    this.auditEngine.setRemoteAuditConfig(null);
+    this.config.remoteAudit = undefined;
+  }
+
+  public addRuleVersion(ruleVersion: RuleVersion): void {
+    this.ruleConfigManager.addRuleVersion(ruleVersion);
+  }
+
+  public getRuleVersion(version: string): RuleVersion | undefined {
+    return this.ruleConfigManager.getRuleVersion(version);
+  }
+
+  public getAllRuleVersions(): RuleVersion[] {
+    return this.ruleConfigManager.getAllRuleVersions();
+  }
+
+  public setSceneRuleVersion(scene: string, version: string): void {
+    this.ruleConfigManager.setSceneRuleVersion(scene, version);
+  }
+
+  public getRuleVersionForScene(scene: string): string {
+    return this.ruleConfigManager.getRuleVersionForScene(scene);
+  }
+
+  public captureRuleSnapshot(scene: string): RuleSnapshot {
+    return this.ruleConfigManager.captureRuleSnapshot(scene);
+  }
+
   public updateConfig(partialConfig: Partial<SDKConfig>): void {
     this.ruleConfigManager.updateConfig(partialConfig);
     this.retryManager.updateConfig(partialConfig);
     this.config = { ...this.config, ...partialConfig };
+    if (partialConfig.remoteAudit) {
+      this.auditEngine.setRemoteAuditConfig(partialConfig.remoteAudit);
+    }
   }
 
   public getConfig(): SDKConfig {

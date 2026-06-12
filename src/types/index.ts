@@ -28,6 +28,21 @@ export enum AuditIntensity {
   VERY_STRICT = 'very_strict',
 }
 
+export enum FeedbackStatus {
+  SUBMITTED = 'submitted',
+  PROCESSING = 'processing',
+  RESOLVED = 'resolved',
+  DISMISSED = 'dismissed',
+}
+
+export enum FeedbackReasonCategory {
+  FALSE_POSITIVE = 'false_positive',
+  CONTEXT_IGNORED = 'context_ignored',
+  RULE_TOO_STRICT = 'rule_too_strict',
+  WHITELIST_MISSING = 'whitelist_missing',
+  OTHER = 'other',
+}
+
 export interface HitFragment {
   text: string;
   start: number;
@@ -35,6 +50,9 @@ export interface HitFragment {
   category: RiskCategory;
   confidence: number;
   ruleId?: string;
+  whitelisted?: boolean;
+  whitelistReason?: string;
+  whitelistSource?: string;
 }
 
 export interface WhitelistWord {
@@ -42,6 +60,14 @@ export interface WhitelistWord {
   category: RiskCategory;
   reason?: string;
   createdAt: number;
+  relatedPatterns?: string[];
+}
+
+export interface WhitelistHitInfo {
+  word: string;
+  category: RiskCategory;
+  reason?: string;
+  releasedFragments: string[];
 }
 
 export interface SceneParams {
@@ -49,6 +75,7 @@ export interface SceneParams {
   intensity: AuditIntensity;
   businessTag?: string;
   customRules?: string[];
+  ruleVersion?: string;
 }
 
 export interface HitDetail {
@@ -80,6 +107,29 @@ export interface BatchAuditRequest {
   concurrency?: number;
 }
 
+export interface RemoteAuditResult {
+  riskLevel: RiskLevel;
+  isPassed: boolean;
+  hitDetails: HitDetail[];
+  suggestions: string[];
+  displayReason: string;
+  confidence: number;
+  costMs: number;
+  raw?: unknown;
+}
+
+export interface RemoteAuditChannel {
+  name: string;
+  audit(request: TextAuditRequest): Promise<RemoteAuditResult>;
+}
+
+export interface RemoteAuditConfig {
+  channel: RemoteAuditChannel;
+  triggerLevel?: RiskLevel;
+  timeoutMs?: number;
+  fallbackToLocal?: boolean;
+}
+
 export interface TextAuditResult {
   requestId: string;
   text: string;
@@ -90,12 +140,25 @@ export interface TextAuditResult {
   displayReason: string;
   businessTag: string;
   whitelistHits: string[];
+  whitelistHitInfos: WhitelistHitInfo[];
   sceneParams: SceneParams;
   retryCount: number;
   reviewStatus: ReviewStatus;
   isMisjudged: boolean;
+  manuallyReviewed: boolean;
   timestamp: number;
   costMs: number;
+  localResult?: {
+    riskLevel: RiskLevel;
+    isPassed: boolean;
+    hitDetails: HitDetail[];
+    displayReason: string;
+  };
+  remoteResult?: RemoteAuditResult;
+  remoteAuditUsed: boolean;
+  remoteAuditFallback: boolean;
+  ruleVersion?: string;
+  ruleSnapshot?: RuleSnapshot;
 }
 
 export interface BatchAuditResult {
@@ -118,6 +181,9 @@ export interface AuditStatistics {
   retryRate: number;
   misjudgeRate: number;
   manualReviewRate: number;
+  manuallyReviewedCount: number;
+  remoteAuditCount: number;
+  remoteAuditFallbackCount: number;
   periodStart: number;
   periodEnd: number;
 }
@@ -126,6 +192,24 @@ export interface RuleConfig {
   enabled: boolean;
   threshold: number;
   level: RiskLevel;
+}
+
+export interface RuleVersion {
+  version: string;
+  description?: string;
+  createdAt: number;
+  intensity?: AuditIntensity;
+  customRules?: Record<string, RuleConfig>;
+  whitelistWords?: WhitelistWord[];
+}
+
+export interface RuleSnapshot {
+  version: string;
+  scene: string;
+  intensity: AuditIntensity;
+  customRules: Record<string, RuleConfig>;
+  whitelistWords: WhitelistWord[];
+  capturedAt: number;
 }
 
 export interface SDKConfig {
@@ -142,12 +226,21 @@ export interface SDKConfig {
   endpoint?: string;
   timeoutMs?: number;
   sceneIntensityMap?: Record<string, AuditIntensity>;
+  sceneRuleVersions?: Record<string, string>;
+  ruleVersions?: Record<string, RuleVersion>;
+  remoteAudit?: RemoteAuditConfig;
 }
 
 export interface MisjudgeFeedback {
+  id: string;
   requestId: string;
   category: RiskCategory;
   feedback: string;
+  reasonCategory: FeedbackReasonCategory;
+  status: FeedbackStatus;
+  handler?: string;
+  handledAt?: number;
+  handleComment?: string;
   contact?: string;
   createdAt: number;
 }
@@ -159,4 +252,10 @@ export interface ManualReviewRecord {
   reviewer: string;
   reviewedAt: number;
   comment?: string;
+}
+
+export interface AuditChainResult {
+  originalResult: TextAuditResult;
+  reviewRecord: ManualReviewRecord | null;
+  feedbacks: MisjudgeFeedback[];
 }

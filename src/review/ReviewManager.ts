@@ -4,11 +4,14 @@ import {
   ManualReviewRecord,
   MisjudgeFeedback,
   RiskCategory,
+  FeedbackReasonCategory,
+  FeedbackStatus,
+  AuditChainResult,
 } from '../types';
 
 export class ReviewManager {
   private reviewRecords: Map<string, ManualReviewRecord> = new Map();
-  private misjudgeFeedbacks: Map<string, MisjudgeFeedback> = new Map();
+  private misjudgeFeedbacks: Map<string, MisjudgeFeedback[]> = new Map();
   private auditResults: Map<string, TextAuditResult> = new Map();
 
   public storeResult(result: TextAuditResult): void {
@@ -17,6 +20,20 @@ export class ReviewManager {
 
   public queryByRequestId(requestId: string): TextAuditResult | null {
     return this.auditResults.get(requestId) || null;
+  }
+
+  public queryAuditChain(requestId: string): AuditChainResult | null {
+    const originalResult = this.auditResults.get(requestId);
+    if (!originalResult) return null;
+
+    const reviewRecord = this.reviewRecords.get(requestId) || null;
+    const feedbacks = this.misjudgeFeedbacks.get(requestId) || [];
+
+    return {
+      originalResult,
+      reviewRecord,
+      feedbacks,
+    };
   }
 
   public getReviewRecord(requestId: string): ManualReviewRecord | null {
@@ -54,6 +71,7 @@ export class ReviewManager {
 
     originalResult.reviewStatus = status;
     originalResult.isMisjudged = isMisjudged;
+    originalResult.manuallyReviewed = true;
 
     if (isMisjudged && status === ReviewStatus.APPROVED) {
       originalResult.isPassed = true;
@@ -78,32 +96,69 @@ export class ReviewManager {
     return this.manualReview(requestId, ReviewStatus.MISJUDGED, reviewer, comment, true);
   }
 
-  public submitMisjudgeFeedback(
-    requestId: string,
-    category: RiskCategory,
-    feedback: string,
-    contact?: string
-  ): MisjudgeFeedback {
+  public submitMisjudgeFeedback(params: {
+    requestId: string;
+    category: RiskCategory;
+    feedback: string;
+    reasonCategory: FeedbackReasonCategory;
+    contact?: string;
+  }): MisjudgeFeedback {
+    const { requestId, category, feedback, reasonCategory, contact } = params;
+
     const record: MisjudgeFeedback = {
+      id: `fb_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
       requestId,
       category,
       feedback,
+      reasonCategory,
+      status: FeedbackStatus.SUBMITTED,
       contact,
       createdAt: Date.now(),
     };
 
-    const key = `${requestId}_${Date.now()}`;
-    this.misjudgeFeedbacks.set(key, record);
+    const existing = this.misjudgeFeedbacks.get(requestId) || [];
+    existing.push(record);
+    this.misjudgeFeedbacks.set(requestId, existing);
 
     return record;
   }
 
-  public getMisjudgeFeedbacks(requestId?: string): MisjudgeFeedback[] {
-    const feedbacks = Array.from(this.misjudgeFeedbacks.values());
-    if (requestId) {
-      return feedbacks.filter((f) => f.requestId === requestId);
+  public processFeedback(
+    feedbackId: string,
+    handler: string,
+    status: FeedbackStatus.PROCESSING | FeedbackStatus.RESOLVED | FeedbackStatus.DISMISSED,
+    comment?: string
+  ): MisjudgeFeedback | null {
+    for (const [, feedbacks] of this.misjudgeFeedbacks) {
+      const feedback = feedbacks.find((f) => f.id === feedbackId);
+      if (feedback) {
+        feedback.status = status;
+        feedback.handler = handler;
+        feedback.handledAt = Date.now();
+        feedback.handleComment = comment;
+        return feedback;
+      }
     }
-    return feedbacks;
+    return null;
+  }
+
+  public getMisjudgeFeedbacks(requestId?: string): MisjudgeFeedback[] {
+    if (requestId) {
+      return this.misjudgeFeedbacks.get(requestId) || [];
+    }
+    const allFeedbacks: MisjudgeFeedback[] = [];
+    this.misjudgeFeedbacks.forEach((feedbacks) => {
+      allFeedbacks.push(...feedbacks);
+    });
+    return allFeedbacks.sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  public getFeedbackById(feedbackId: string): MisjudgeFeedback | null {
+    for (const [, feedbacks] of this.misjudgeFeedbacks) {
+      const feedback = feedbacks.find((f) => f.id === feedbackId);
+      if (feedback) return feedback;
+    }
+    return null;
   }
 
   public getReviewRecords(
@@ -138,13 +193,18 @@ export class ReviewManager {
     approved: number;
     rejected: number;
     misjudged: number;
+    manuallyReviewed: number;
   } {
     let pending = 0;
     let approved = 0;
     let rejected = 0;
     let misjudged = 0;
+    let manuallyReviewed = 0;
 
     this.auditResults.forEach((result) => {
+      if (result.manuallyReviewed) {
+        manuallyReviewed++;
+      }
       switch (result.reviewStatus) {
         case ReviewStatus.PENDING:
           pending++;
@@ -167,6 +227,7 @@ export class ReviewManager {
       approved,
       rejected,
       misjudged,
+      manuallyReviewed,
     };
   }
 
@@ -177,20 +238,11 @@ export class ReviewManager {
       if (result.timestamp < beforeTimestamp) {
         this.auditResults.delete(key);
         this.reviewRecords.delete(key);
+        this.misjudgeFeedbacks.delete(key);
         clearedCount++;
       }
     });
 
-    const misjudgeKeysToDelete: string[] = [];
-    this.misjudgeFeedbacks.forEach((feedback, key) => {
-      if (feedback.createdAt < beforeTimestamp) {
-        misjudgeKeysToDelete.push(key);
-      }
-    });
-    misjudgeKeysToDelete.forEach((key) => {
-      this.misjudgeFeedbacks.delete(key);
-    });
-
-    return clearedCount + misjudgeKeysToDelete.length;
+    return clearedCount;
   }
 }

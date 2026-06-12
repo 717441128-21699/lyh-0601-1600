@@ -5,10 +5,36 @@ import {
   AuditIntensity,
   ReviewStatus,
   WhitelistWord,
+  FeedbackReasonCategory,
+  FeedbackStatus,
+  RemoteAuditChannel,
+  RemoteAuditResult,
+  TextAuditRequest,
 } from '../src/index';
 
+const mockRemoteChannel: RemoteAuditChannel = {
+  name: 'mock-remote-ai',
+  async audit(request: TextAuditRequest): Promise<RemoteAuditResult> {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return {
+      riskLevel: RiskLevel.HIGH,
+      isPassed: false,
+      hitDetails: [{
+        category: RiskCategory.AD,
+        level: RiskLevel.HIGH,
+        fragments: [],
+        description: '远程AI检测到广告推广内容',
+      }],
+      suggestions: ['远程审核建议: 请移除广告内容'],
+      displayReason: '远程AI审核: 检测到广告推广内容',
+      confidence: 0.85,
+      costMs: 50,
+    };
+  },
+};
+
 async function main() {
-  console.log('=== AI 内容审核 SDK 使用示例 ===\n');
+  console.log('=== AI 内容审核 SDK 增强版使用示例 ===\n');
 
   const sdk = new ContentAuditSDK({
     appKey: 'test-app-key-123',
@@ -17,195 +43,220 @@ async function main() {
     enableRetry: true,
     maxRetryCount: 3,
     enableWhitelist: true,
+    whitelistWords: [
+      {
+        word: '客服电话',
+        category: RiskCategory.AD,
+        reason: '客服场景允许留联系方式',
+        createdAt: Date.now(),
+        relatedPatterns: ['138', '139', '158'],
+      },
+    ],
     sceneIntensityMap: {
       post: AuditIntensity.STRICT,
       chat: AuditIntensity.LOOSE,
       'customer-service': AuditIntensity.STANDARD,
     },
+    sceneRuleVersions: {
+      comment: 'v1',
+      'customer-service': 'v1',
+    },
+    ruleVersions: {
+      v1: {
+        version: 'v1',
+        description: '初始规则版本',
+        createdAt: Date.now(),
+      },
+      v2: {
+        version: 'v2',
+        description: '增强敏感词检测',
+        createdAt: Date.now(),
+        intensity: AuditIntensity.STRICT,
+      },
+    },
   });
 
-  console.log('--- 1. 基础文本检测 ---');
+  console.log('--- 1. 白名单跨分类释放 ---');
   const result1 = await sdk.auditText({
-    text: '你好，这是一条正常的评论内容。',
-    scene: 'comment',
-    businessTag: '用户评论',
-  });
-  console.log('文本:', result1.text);
-  console.log('是否通过:', result1.isPassed);
-  console.log('风险等级:', sdk.getLevelText(result1.riskLevel));
-  console.log('可展示原因:', result1.displayReason);
-  console.log('调用编号:', result1.requestId);
-  console.log('');
-
-  console.log('--- 2. 广告内容检测 ---');
-  const result2 = await sdk.auditText({
-    text: '加微信: test123 免费领取优惠，扫码下单打折促销！联系方式: 13812345678',
-    scene: 'comment',
-  });
-  console.log('是否通过:', result2.isPassed);
-  console.log('风险等级:', sdk.getLevelText(result2.riskLevel));
-  console.log('命中详情:');
-  result2.hitDetails.forEach((detail, i) => {
-    console.log(`  ${i + 1}. ${sdk.getCategoryText(detail.category)} - ${sdk.getLevelText(detail.level)}`);
-    console.log(`     命中片段: ${detail.fragments.map(f => f.text).join(', ')}`);
-  });
-  console.log('处理建议:', result2.suggestions);
-  console.log('');
-
-  console.log('--- 3. 辱骂内容检测 ---');
-  const result3 = await sdk.auditText({
-    text: '你这个蠢货，闭嘴吧，真恶心！',
-    scene: 'comment',
-  });
-  console.log('是否通过:', result3.isPassed);
-  console.log('风险等级:', sdk.getLevelText(result3.riskLevel));
-  console.log('展示原因:', result3.displayReason);
-  console.log('脱敏后文本:', sdk.getDisplayText(result3));
-  console.log('');
-
-  console.log('--- 4. 隐私信息检测 ---');
-  const result4 = await sdk.auditText({
-    text: '我的身份证号是110101199001011234，手机号13912345678，邮箱test@example.com',
-    scene: 'chat',
-  });
-  console.log('是否通过:', result4.isPassed);
-  console.log('风险等级:', sdk.getLevelText(result4.riskLevel));
-  result4.hitDetails.forEach((detail) => {
-    console.log(`  ${sdk.getCategoryText(detail.category)}: ${detail.fragments.length}处`);
-  });
-  console.log('');
-
-  console.log('--- 5. 敏感内容检测 ---');
-  const result5 = await sdk.auditText({
-    text: '禁止传播毒品和赌博相关内容',
-    scene: 'post',
-  });
-  console.log('是否通过:', result5.isPassed);
-  console.log('风险等级:', sdk.getLevelText(result5.riskLevel));
-  console.log('');
-
-  console.log('--- 6. 结果解释 ---');
-  const explanation = sdk.explainResult(result2);
-  console.log(explanation);
-  console.log('');
-
-  console.log('--- 7. 白名单功能 ---');
-  const whitelistWord: WhitelistWord = {
-    word: '加微信',
-    category: RiskCategory.AD,
-    reason: '客服场景允许留联系方式',
-    createdAt: Date.now(),
-  };
-  sdk.addWhitelistWord(whitelistWord);
-  console.log('添加白名单词: 加微信');
-
-  const result6 = await sdk.auditText({
-    text: '加微信: test123 咨询客服',
+    text: '请拨打客服电话 13812345678 咨询',
     scene: 'customer-service',
   });
-  console.log('白名单命中:', result6.whitelistHits);
-  console.log('是否通过:', result6.isPassed);
+  console.log('是否通过:', result1.isPassed);
+  console.log('白名单命中详情:');
+  result1.whitelistHitInfos.forEach((info) => {
+    console.log(`  词: ${info.word}`);
+    console.log(`  原因: ${info.reason}`);
+    console.log(`  释放片段: ${info.releasedFragments.join(', ')}`);
+  });
+  console.log('可展示原因:', result1.displayReason);
   console.log('');
 
-  console.log('--- 8. 不同场景审核强度 ---');
-  console.log('评论场景强度:', sdk.getIntensityText(sdk.getSceneIntensity('comment')));
-  console.log('发帖场景强度:', sdk.getIntensityText(sdk.getSceneIntensity('post')));
-  console.log('聊天场景强度:', sdk.getIntensityText(sdk.getSceneIntensity('chat')));
+  console.log('--- 2. 规则版本和灰度 ---');
+  const sceneParams = sdk.getSceneParams('comment');
+  console.log('评论场景规则版本:', sceneParams.ruleVersion);
+  console.log('客服场景规则版本:', sdk.getRuleVersionForScene('customer-service'));
 
-  sdk.setSceneIntensity('custom-scene', AuditIntensity.VERY_STRICT);
-  console.log('自定义场景强度:', sdk.getIntensityText(sdk.getSceneIntensity('custom-scene')));
+  sdk.addRuleVersion({
+    version: 'v2-cs',
+    description: '客服场景专用规则 - 宽松版',
+    createdAt: Date.now(),
+    intensity: AuditIntensity.LOOSE,
+  });
+  sdk.setSceneRuleVersion('customer-service', 'v2-cs');
+  console.log('灰度切换后客服场景版本:', sdk.getRuleVersionForScene('customer-service'));
+
+  const snapshot = sdk.captureRuleSnapshot('customer-service');
+  console.log('规则快照版本:', snapshot.version);
+  console.log('快照强度:', sdk.getIntensityText(snapshot.intensity));
+  console.log('快照白名单数:', snapshot.whitelistWords.length);
   console.log('');
 
-  console.log('--- 9. 批量检测 ---');
+  const result2 = await sdk.auditText({
+    text: '客服电话 13812345678，加微信咨询',
+    scene: 'customer-service',
+  });
+  console.log('灰度后审核结果 - 规则版本:', result2.ruleVersion);
+  console.log('灰度后是否通过:', result2.isPassed);
+  console.log('');
+
+  console.log('--- 3. 远程审核通道 ---');
+  sdk.setRemoteAuditChannel({
+    channel: mockRemoteChannel,
+    triggerLevel: RiskLevel.MEDIUM,
+    timeoutMs: 3000,
+    fallbackToLocal: true,
+  });
+  console.log('已启用远程审核通道 (触发级别: 中风险及以上)');
+
+  const result3 = await sdk.auditText({
+    text: '加微信: abc123 免费领取优惠！',
+    scene: 'comment',
+  });
+  console.log('远程审核启用:', result3.remoteAuditUsed);
+  console.log('远程审核兜底:', result3.remoteAuditFallback);
+  if (result3.localResult) {
+    console.log('本地结论:', sdk.getLevelText(result3.localResult.riskLevel), result3.localResult.isPassed ? '通过' : '不通过');
+  }
+  if (result3.remoteResult) {
+    console.log('远程结论:', sdk.getLevelText(result3.remoteResult.riskLevel), result3.remoteResult.isPassed ? '通过' : '不通过');
+  }
+  console.log('最终结论:', sdk.getLevelText(result3.riskLevel), result3.isPassed ? '通过' : '不通过');
+  console.log('');
+
+  const safeResult = await sdk.auditText({
+    text: '今天天气真好，适合出去散步。',
+    scene: 'comment',
+  });
+  console.log('安全内容远程审核启用:', safeResult.remoteAuditUsed, '(安全内容不触发远程)');
+  console.log('');
+
+  sdk.disableRemoteAudit();
+
+  console.log('--- 4. 批量审核统计准确性 ---');
   const batchResult = await sdk.batchAudit({
     items: [
       { text: '正常内容1' },
-      { text: '加微信: abc123 推广广告' },
-      { text: '你好，请问有什么可以帮您？' },
-      { text: '傻逼玩意，滚蛋！' },
-      { text: '身份证号110101199001011234' },
+      { text: '正常内容2' },
+      { text: '你好世界' },
     ],
     scene: 'comment',
-    concurrency: 3,
   });
-  console.log('批次ID:', batchResult.batchId);
-  console.log('总数:', batchResult.total);
-  console.log('通过:', batchResult.passed);
-  console.log('未通过:', batchResult.failed);
-  console.log('耗时:', batchResult.costMs + 'ms');
-  batchResult.results.forEach((r, i) => {
-    console.log(`  ${i + 1}. [${r.isPassed ? '通过' : '不通过'}] ${sdk.getLevelText(r.riskLevel)} - ${r.text.substring(0, 20)}...`);
-  });
-  console.log('');
+  console.log('批量提交:', batchResult.total, '条');
+  console.log('批量通过:', batchResult.passed, '条');
+  console.log('批量未通过:', batchResult.failed, '条');
 
-  console.log('--- 10. 调用编号查询 ---');
-  const queryResult = sdk.queryByRequestId(result1.requestId);
-  if (queryResult) {
-    console.log('查询成功:', queryResult.text.substring(0, 30) + '...');
-    console.log('审核状态:', queryResult.reviewStatus);
-  }
-  console.log('');
+  await sdk.auditText({ text: '单条测试1', scene: 'comment' });
+  await sdk.auditText({ text: '单条测试2', scene: 'comment' });
 
-  console.log('--- 11. 人工复核 ---');
-  const reviewResult = sdk.manualReview(
-    result2.requestId,
-    ReviewStatus.APPROVED,
-    'reviewer_001',
-    '经过人工审核，内容合规'
-  );
-  if (reviewResult) {
-    console.log('复核状态:', reviewResult.reviewResult.status);
-    console.log('复核人:', reviewResult.reviewer);
-    console.log('复核时间:', new Date(reviewResult.reviewedAt).toLocaleString());
-  }
-  console.log('');
-
-  console.log('--- 12. 误判反馈 ---');
-  const feedback = sdk.submitMisjudgeFeedback(
-    result2.requestId,
-    RiskCategory.AD,
-    '这是正常的客服联系方式，不是广告',
-    'user@example.com'
-  );
-  console.log('反馈提交成功:', feedback.requestId);
-  console.log('反馈内容:', feedback.feedback);
-  sdk.markMisjudged(result2.requestId, 'admin_001', '确认为误判，已修正');
-  console.log('标记为误判');
-  console.log('');
-
-  console.log('--- 13. 统计摘要 ---');
   const stats = sdk.getStatistics();
+  console.log('');
+  console.log('--- 5. 统计摘要 ---');
   console.log('总请求数:', stats.totalRequests);
   console.log('通过数:', stats.passedCount);
   console.log('拦截数:', stats.blockedCount);
-  console.log('平均耗时:', stats.avgCostMs + 'ms');
-  console.log('误判率:', (stats.misjudgeRate * 100).toFixed(2) + '%');
+  console.log('人工复核数:', stats.manuallyReviewedCount);
   console.log('人工复核率:', (stats.manualReviewRate * 100).toFixed(2) + '%');
-  console.log('分类分布:');
-  Object.entries(stats.categoryDistribution).forEach(([category, count]) => {
-    console.log(`  ${sdk.getCategoryText(category as RiskCategory)}: ${count}`);
-  });
-  console.log('等级分布:');
-  Object.entries(stats.levelDistribution).forEach(([level, count]) => {
-    console.log(`  ${sdk.getLevelText(level)}: ${count}`);
-  });
+  console.log('远程审核数:', stats.remoteAuditCount);
+  console.log('远程兜底数:', stats.remoteAuditFallbackCount);
+  console.log('通过率:', stats.totalRequests > 0 ? ((stats.passedCount / stats.totalRequests) * 100).toFixed(2) + '%' : 'N/A');
   console.log('');
 
-  console.log('--- 14. 场景统计 ---');
-  const commentStats = sdk.getSceneStats('comment');
-  console.log('评论场景:');
-  console.log('  请求数:', commentStats.count);
-  console.log('  通过率:', (commentStats.passRate * 100).toFixed(2) + '%');
-  console.log('  平均耗时:', commentStats.avgCostMs + 'ms');
+  console.log('--- 6. 人工复核 + 统计联动 ---');
+  const reviewStatsBefore = sdk.getReviewStats();
+  console.log('复核前 - 人工复核数:', reviewStatsBefore.manuallyReviewed);
+
+  sdk.approve(result3.requestId, 'reviewer_001', '人工确认通过');
+
+  const reviewStatsAfter = sdk.getReviewStats();
+  console.log('复核后 - 人工复核数:', reviewStatsAfter.manuallyReviewed);
+
+  const statsAfterReview = sdk.getStatistics();
+  console.log('统计中人工复核数:', statsAfterReview.manuallyReviewedCount);
+  console.log('统计中人工复核率:', (statsAfterReview.manualReviewRate * 100).toFixed(2) + '%');
   console.log('');
 
-  console.log('--- 15. 复核统计 ---');
-  const reviewStats = sdk.getReviewStats();
-  console.log('总记录:', reviewStats.total);
-  console.log('待复核:', reviewStats.pending);
-  console.log('已通过:', reviewStats.approved);
-  console.log('已驳回:', reviewStats.rejected);
-  console.log('误判:', reviewStats.misjudged);
+  console.log('--- 7. 误判反馈（增强版） ---');
+  const feedback = sdk.submitMisjudgeFeedback({
+    requestId: result3.requestId,
+    category: RiskCategory.AD,
+    feedback: '这是正常的客服联系方式，不是广告',
+    reasonCategory: FeedbackReasonCategory.WHITELIST_MISSING,
+    contact: 'user@example.com',
+  });
+  console.log('反馈ID:', feedback.id);
+  console.log('原因分类:', feedback.reasonCategory);
+  console.log('处理状态:', feedback.status);
+
+  sdk.processFeedback(
+    feedback.id,
+    'admin_001',
+    FeedbackStatus.PROCESSING,
+    '正在核实反馈内容'
+  );
+  const updatedFb = sdk.getMisjudgeFeedbacks(result3.requestId)[0];
+  console.log('处理后状态:', updatedFb.status);
+  console.log('处理人:', updatedFb.handler);
+  console.log('处理备注:', updatedFb.handleComment);
+
+  sdk.processFeedback(
+    feedback.id,
+    'admin_001',
+    FeedbackStatus.RESOLVED,
+    '已确认为误判，将添加白名单'
+  );
+  const resolvedFb = sdk.getMisjudgeFeedbacks(result3.requestId)[0];
+  console.log('最终状态:', resolvedFb.status);
+  console.log('');
+
+  console.log('--- 8. 调用编号查询完整链路 ---');
+  const chain = sdk.queryAuditChain(result3.requestId);
+  if (chain) {
+    console.log('原始审核 - 风险等级:', sdk.getLevelText(chain.originalResult.riskLevel));
+    console.log('原始审核 - 是否通过:', chain.originalResult.isPassed);
+    console.log('原始审核 - 规则版本:', chain.originalResult.ruleVersion);
+    console.log('复核记录:', chain.reviewRecord ? '有' : '无');
+    if (chain.reviewRecord) {
+      console.log('  复核状态:', chain.reviewRecord.reviewResult.status);
+      console.log('  复核人:', chain.reviewRecord.reviewer);
+      console.log('  是否误判:', chain.reviewRecord.reviewResult.isMisjudged);
+    }
+    console.log('误判反馈数:', chain.feedbacks.length);
+    chain.feedbacks.forEach((fb, i) => {
+      console.log(`  反馈${i + 1}: ${fb.reasonCategory} - ${fb.status}`);
+    });
+  }
+  console.log('');
+
+  console.log('--- 9. 完整链路解释 ---');
+  const chainExplanation = sdk.explainAuditChain(result3.requestId);
+  if (chainExplanation) {
+    console.log(chainExplanation);
+  }
+  console.log('');
+
+  console.log('--- 10. 结果解释（含白名单放行来源） ---');
+  const explanation = sdk.explainResult(result1);
+  console.log(explanation);
   console.log('');
 
   console.log('=== 示例执行完成 ===');

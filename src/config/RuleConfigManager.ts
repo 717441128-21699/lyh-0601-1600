@@ -6,6 +6,8 @@ import {
   SceneParams,
   RuleConfig,
   RiskLevel,
+  RuleVersion,
+  RuleSnapshot,
 } from '../types';
 
 export class RuleConfigManager {
@@ -13,12 +15,16 @@ export class RuleConfigManager {
   private whitelistMap: Map<string, WhitelistWord> = new Map();
   private sceneIntensityMap: Map<string, AuditIntensity> = new Map();
   private customRules: Map<string, RuleConfig> = new Map();
+  private ruleVersions: Map<string, RuleVersion> = new Map();
+  private sceneRuleVersions: Map<string, string> = new Map();
 
   constructor(config: SDKConfig) {
     this.config = { ...this.getDefaultConfig(), ...config };
     this.initializeWhitelist();
     this.initializeSceneIntensity();
     this.initializeCustomRules();
+    this.initializeRuleVersions();
+    this.initializeSceneRuleVersions();
   }
 
   private getDefaultConfig(): Partial<SDKConfig> {
@@ -57,6 +63,29 @@ export class RuleConfigManager {
     }
   }
 
+  private initializeRuleVersions(): void {
+    if (this.config.ruleVersions) {
+      Object.entries(this.config.ruleVersions).forEach(([version, ruleVersion]) => {
+        this.ruleVersions.set(version, ruleVersion);
+      });
+    }
+    if (this.ruleVersions.size === 0) {
+      this.ruleVersions.set('v1', {
+        version: 'v1',
+        description: '默认规则版本',
+        createdAt: Date.now(),
+      });
+    }
+  }
+
+  private initializeSceneRuleVersions(): void {
+    if (this.config.sceneRuleVersions) {
+      Object.entries(this.config.sceneRuleVersions).forEach(([scene, version]) => {
+        this.sceneRuleVersions.set(scene, version);
+      });
+    }
+  }
+
   public getConfig(): SDKConfig {
     return { ...this.config };
   }
@@ -75,6 +104,14 @@ export class RuleConfigManager {
       this.customRules.clear();
       this.initializeCustomRules();
     }
+    if (partialConfig.ruleVersions) {
+      this.ruleVersions.clear();
+      this.initializeRuleVersions();
+    }
+    if (partialConfig.sceneRuleVersions) {
+      this.sceneRuleVersions.clear();
+      this.initializeSceneRuleVersions();
+    }
   }
 
   public getSceneParams(scene?: string, businessTag?: string): SceneParams {
@@ -82,12 +119,53 @@ export class RuleConfigManager {
     const intensity = this.sceneIntensityMap.get(sceneName) ||
       this.config.defaultIntensity ||
       AuditIntensity.STANDARD;
+    const ruleVersion = this.sceneRuleVersions.get(sceneName) || 'v1';
 
     return {
       scene: sceneName,
       intensity,
       businessTag: businessTag || this.getBusinessTag(sceneName),
       customRules: this.getSceneCustomRules(sceneName),
+      ruleVersion,
+    };
+  }
+
+  public getRuleVersionForScene(scene: string): string {
+    return this.sceneRuleVersions.get(scene) || 'v1';
+  }
+
+  public setSceneRuleVersion(scene: string, version: string): void {
+    if (this.ruleVersions.has(version)) {
+      this.sceneRuleVersions.set(scene, version);
+    }
+  }
+
+  public addRuleVersion(ruleVersion: RuleVersion): void {
+    this.ruleVersions.set(ruleVersion.version, ruleVersion);
+  }
+
+  public getRuleVersion(version: string): RuleVersion | undefined {
+    return this.ruleVersions.get(version);
+  }
+
+  public getAllRuleVersions(): RuleVersion[] {
+    return Array.from(this.ruleVersions.values());
+  }
+
+  public captureRuleSnapshot(scene: string): RuleSnapshot {
+    const sceneParams = this.getSceneParams(scene);
+    const ruleVersion = this.ruleVersions.get(sceneParams.ruleVersion || 'v1');
+    const versionIntensity = ruleVersion?.intensity;
+    const versionCustomRules = ruleVersion?.customRules;
+    const versionWhitelistWords = ruleVersion?.whitelistWords;
+
+    return {
+      version: sceneParams.ruleVersion || 'v1',
+      scene,
+      intensity: versionIntensity || sceneParams.intensity,
+      customRules: versionCustomRules || this.getAllCustomRules(),
+      whitelistWords: versionWhitelistWords || this.getWhitelistWords(),
+      capturedAt: Date.now(),
     };
   }
 
@@ -149,13 +227,33 @@ export class RuleConfigManager {
     return thresholds[intensity];
   }
 
-  public isWhitelisted(word: string, category?: RiskCategory): boolean {
-    if (!this.config.enableWhitelist) return false;
+  public checkWhitelist(word: string): { whitelisted: boolean; info: WhitelistWord | null } {
+    if (!this.config.enableWhitelist) {
+      return { whitelisted: false, info: null };
+    }
     const lowerWord = word.toLowerCase();
     const whitelistWord = this.whitelistMap.get(lowerWord);
-    if (!whitelistWord) return false;
-    if (category && whitelistWord.category !== category) return false;
+    if (!whitelistWord) {
+      return { whitelisted: false, info: null };
+    }
+    return { whitelisted: true, info: whitelistWord };
+  }
+
+  public isWhitelisted(word: string, category?: RiskCategory): boolean {
+    const { whitelisted, info } = this.checkWhitelist(word);
+    if (!whitelisted || !info) return false;
+    if (category && info.category !== category) return false;
     return true;
+  }
+
+  public isWhitelistedAnyCategory(word: string): { whitelisted: boolean; info: WhitelistWord | null } {
+    return this.checkWhitelist(word);
+  }
+
+  public getWhitelistRelatedPatterns(word: string): string[] {
+    const lowerWord = word.toLowerCase();
+    const whitelistWord = this.whitelistMap.get(lowerWord);
+    return whitelistWord?.relatedPatterns || [];
   }
 
   public addWhitelistWord(word: WhitelistWord): void {
@@ -202,7 +300,7 @@ export class RuleConfigManager {
 
   public getRiskLevel(confidence: number, category: RiskCategory, intensity: AuditIntensity): RiskLevel {
     const threshold = this.getIntensityThreshold(intensity)[category];
-    
+
     if (confidence >= threshold && confidence >= 0.9) return RiskLevel.DANGEROUS;
     if (confidence >= threshold && confidence >= 0.75) return RiskLevel.HIGH;
     if (confidence >= threshold && confidence >= 0.55) return RiskLevel.MEDIUM;

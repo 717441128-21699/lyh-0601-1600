@@ -3,25 +3,26 @@ import {
   TextAuditResult,
   RiskCategory,
   RiskLevel,
-  BatchAuditResult,
 } from '../types';
 
 export class StatisticsManager {
   private results: TextAuditResult[] = [];
   private maxStoredResults = 10000;
   private periodStart = Date.now();
+  private manuallyReviewedIds: Set<string> = new Set();
 
   public recordResult(result: TextAuditResult): void {
     this.results.push(result);
     if (this.results.length > this.maxStoredResults) {
-      this.results.shift();
+      const removed = this.results.shift();
+      if (removed && this.manuallyReviewedIds.has(removed.requestId)) {
+        this.manuallyReviewedIds.delete(removed.requestId);
+      }
     }
   }
 
-  public recordBatchResult(batchResult: BatchAuditResult): void {
-    batchResult.results.forEach((result) => {
-      this.recordResult(result);
-    });
+  public markManuallyReviewed(requestId: string): void {
+    this.manuallyReviewedIds.add(requestId);
   }
 
   public getStatistics(periodStart?: number, periodEnd?: number): AuditStatistics {
@@ -55,7 +56,9 @@ export class StatisticsManager {
     let totalCostMs = 0;
     let retryCount = 0;
     let misjudgeCount = 0;
-    let manualReviewCount = 0;
+    let manuallyReviewedCount = 0;
+    let remoteAuditCount = 0;
+    let remoteAuditFallbackCount = 0;
 
     filteredResults.forEach((result) => {
       levelDistribution[result.riskLevel]++;
@@ -67,8 +70,14 @@ export class StatisticsManager {
       if (result.isMisjudged) {
         misjudgeCount++;
       }
-      if (result.reviewStatus !== 'pending') {
-        manualReviewCount++;
+      if (this.manuallyReviewedIds.has(result.requestId)) {
+        manuallyReviewedCount++;
+      }
+      if (result.remoteAuditUsed) {
+        remoteAuditCount++;
+      }
+      if (result.remoteAuditFallback) {
+        remoteAuditFallbackCount++;
       }
 
       result.hitDetails.forEach((detail) => {
@@ -83,7 +92,7 @@ export class StatisticsManager {
     const avgCostMs = totalRequests > 0 ? Math.round(totalCostMs / totalRequests) : 0;
     const retryRate = totalRequests > 0 ? retryCount / totalRequests : 0;
     const misjudgeRate = totalRequests > 0 ? misjudgeCount / totalRequests : 0;
-    const manualReviewRate = totalRequests > 0 ? manualReviewCount / totalRequests : 0;
+    const manualReviewRate = totalRequests > 0 ? manuallyReviewedCount / totalRequests : 0;
 
     return {
       totalRequests,
@@ -95,6 +104,9 @@ export class StatisticsManager {
       retryRate,
       misjudgeRate,
       manualReviewRate,
+      manuallyReviewedCount,
+      remoteAuditCount,
+      remoteAuditFallbackCount,
       periodStart: start,
       periodEnd: end,
     };
@@ -188,13 +200,15 @@ export class StatisticsManager {
 
   public resetStatistics(): void {
     this.results = [];
+    this.manuallyReviewedIds.clear();
     this.periodStart = Date.now();
   }
 
   public setMaxStoredResults(max: number): void {
     this.maxStoredResults = max;
     if (this.results.length > max) {
-      this.results = this.results.slice(-max);
+      const removed = this.results.splice(0, this.results.length - max);
+      removed.forEach((r) => this.manuallyReviewedIds.delete(r.requestId));
     }
   }
 
