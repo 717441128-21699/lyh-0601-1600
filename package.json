@@ -1,0 +1,32 @@
+{
+  "name": "ai-content-audit-sdk",
+  "version": "1.0.0",
+  "description": "AI 内容审核 SDK，支持文本检测、批量检测、规则配置、结果解释和复核回传",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node examples/basic-usage.js",
+    "example": "ts-node examples/basic-usage.ts"
+  },
+  "keywords": [
+    "ai",
+    "content-audit",
+    "moderation",
+    "text-detection",
+    "content-moderation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ]
+}
